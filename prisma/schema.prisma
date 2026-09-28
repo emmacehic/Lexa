@@ -1,0 +1,284 @@
+// Lexa — transcription & code-switching annotation platform. Created by Emma Cehic.
+// Data model. Deviations and additions are recorded in DECISIONS.md.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  ADMIN
+  CONTRIBUTOR
+}
+
+enum MediaKind {
+  AUDIO
+  VIDEO
+}
+
+enum JobStatus {
+  UPLOADED
+  PROCESSING
+  READY
+  FAILED
+  COMPLETE
+}
+
+enum TimingSource {
+  MEASURED
+  INTERPOLATED
+}
+
+enum AnnStatus {
+  ACTIVE
+  NEEDS_REVIEW
+}
+
+model User {
+  id               String           @id @default(cuid())
+  email            String           @unique
+  name             String
+  passwordHash     String?
+  role             Role             @default(CONTRIBUTOR)
+  spokenLanguages     String[]         @default([])
+  languageProficiency Json             @default("[]")
+  memberships      Membership[]
+  createdAt        DateTime         @default(now())
+
+  // back-relations
+  recordings   Recording[]  @relation("AssignedRecordings")
+  annotations  Annotation[]
+  revisions    Revision[]
+  invitesSent  Invite[]     @relation("InvitesCreated")
+  magicTokens  MagicLinkToken[]
+}
+
+model Project {
+  id            String       @id @default(cuid())
+  name          String
+  // ordered BCP-47 / Whisper ISO 639-1 tags; drives the recognizer
+  languageCodes String[]
+  // extra label types this project allows beyond the two defaults
+  customLabels  Json         @default("[]")
+  // markdown annotation guidelines annotators can reference
+  guidelines    String?
+  members       Membership[]
+  recordings    Recording[]
+  invites       Invite[]
+  speakers      Speaker[]
+  createdAt     DateTime     @default(now())
+}
+
+model Speaker {
+  id               String      @id @default(cuid())
+  projectId        String
+  name             String      // speaker_id, e.g. DE_01_S1
+  ageGroup         String?     // 18–29 / 30–49 / 50+ / unknown
+  gender           String?     // female / male / other/unknown
+  mainLanguage     String?     // L1, e.g. "Bosnian"
+  otherLanguages   String[]    // e.g. ["German", "English"]
+  dominantLanguage String?     // e.g. "German"
+  bilingualStatus  String?     // bilingual / heritage speaker / multilingual
+  heritageLanguage String?     // e.g. "Bosnian"
+  countryOrRegion  String?     // country code, e.g. "ch"
+  currentCountry   String?     // country code, e.g. "ch"
+  generation       String?     // first / second / third
+  languageAtHome   String?     // e.g. "Bosnian + German"
+  speakerRole      String?     // interviewer / interviewee / host / guest
+  metadataSource   String?     // self-report / interviewer / inferred
+  notes            String?
+  project          Project     @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  recordings       Recording[]
+  createdAt        DateTime    @default(now())
+
+  @@index([projectId])
+}
+
+model Membership {
+  id        String  @id @default(cuid())
+  userId    String
+  projectId String
+  user      User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, projectId])
+  @@index([projectId])
+}
+
+enum StorageLocation {
+  LOCAL
+  SUPABASE
+}
+
+model Recording {
+  id               String       @id @default(cuid())
+  projectId        String
+  assignedToId     String?
+  speakerId        String?
+  filename         String
+  mimeType         String
+  byteSize         BigInt
+  durationSec      Float
+  kind             MediaKind // AUDIO | VIDEO
+  storageKey       String
+  storageLocation  StorageLocation @default(LOCAL)
+  waveformPeaks    Json? // Int[] , 400 buckets, 0-100
+  status           JobStatus // UPLOADED PROCESSING READY FAILED COMPLETE
+  failureReason    String?
+  detectedLanguage String?
+  sourceUrl        String?
+  sourceContext    String?
+
+  // IAA: if this recording is a clone for second annotation
+  sourceRecordingId String?
+
+  // pipeline progress the /r/[id]/processing screen subscribes to (§6.3)
+  progress     Int     @default(0)
+  stage        String?
+  refinementSkipped Boolean @default(false)
+
+  project       Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  assignedTo    User?        @relation("AssignedRecordings", fields: [assignedToId], references: [id], onDelete: SetNull)
+  speaker       Speaker?     @relation(fields: [speakerId], references: [id], onDelete: SetNull)
+  sourceRecording Recording? @relation("RecordingClones", fields: [sourceRecordingId], references: [id], onDelete: SetNull)
+  clones        Recording[]  @relation("RecordingClones")
+  segments      Segment[]
+  annotations   Annotation[]
+  revisions     Revision[]
+
+  createdAt DateTime @default(now())
+
+  @@index([projectId])
+  @@index([assignedToId])
+  @@index([speakerId])
+  @@index([sourceRecordingId])
+}
+
+model Segment {
+  id          String  @id @default(cuid())
+  recordingId String
+  index       Int // contiguous, 0-based, re-packed on split/merge
+  start       Float
+  end         Float
+  text        String // derived from words, always kept in sync
+  speakerTag  String?
+  isReviewed  Boolean @default(false)
+
+  recording Recording @relation(fields: [recordingId], references: [id], onDelete: Cascade)
+  words     Word[]
+
+  @@unique([recordingId, index])
+  @@index([recordingId])
+}
+
+model Word {
+  id           String       @id @default(cuid())
+  segmentId    String
+  index        Int // position within segment
+  text         String // surface form incl. punctuation
+  start        Float
+  end          Float
+  confidence   Float? // from STT, null if interpolated
+  timing       TimingSource // MEASURED | INTERPOLATED
+  annotationId String? // linguistic label — at most one
+  correctionId String? // spelling correction — independent of annotationId
+
+  segment    Segment     @relation(fields: [segmentId], references: [id], onDelete: Cascade)
+  annotation Annotation? @relation("LinguisticAnn", fields: [annotationId], references: [id], onDelete: SetNull)
+  correction Annotation? @relation("SpellingCorr", fields: [correctionId], references: [id], onDelete: SetNull)
+
+  @@unique([segmentId, index])
+  @@index([segmentId])
+  @@index([annotationId])
+  @@index([correctionId])
+}
+
+model Annotation {
+  id                String    @id @default(cuid())
+  recordingId       String
+  type              String // "loanword" | "code_switch" | "unclear" | "correction" | custom
+  surface           String // the words as they were when marked
+  start             Float
+  end               Float
+  languageTag       String? // e.g. "en" for an English switch in German
+  nativeAlternative String? // the equivalent in the matrix language
+  pronunciation     String? // "local" | "foreign" | "mixed/unclear"
+  confidence        String? // annotator's confidence: "high" | "medium" | "low"
+  note              String?
+  status            AnnStatus @default(ACTIVE) // ACTIVE | NEEDS_REVIEW
+  words             Word[]    @relation("LinguisticAnn")
+  correctedWords    Word[]    @relation("SpellingCorr")
+  createdById       String
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  recording Recording @relation(fields: [recordingId], references: [id], onDelete: Cascade)
+  createdBy User      @relation(fields: [createdById], references: [id], onDelete: Restrict)
+
+  @@index([recordingId])
+  @@index([createdById])
+}
+
+model Revision {
+  id          String   @id @default(cuid())
+  recordingId String
+  userId      String
+  kind        String // segment.edit | segment.split | ann.create ...
+  payload     Json // inverse patch, enough to undo
+  // an undone revision stays in the audit trail; the cursor is what moves
+  undone      Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  recording Recording @relation(fields: [recordingId], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([recordingId, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Additions beyond §5 — required by §3 (invitation-only signup, magic links).
+// Recorded in DECISIONS.md.
+// ---------------------------------------------------------------------------
+
+model Invite {
+  id          String    @id @default(cuid())
+  tokenHash   String    @unique
+  email       String?
+  projectId   String
+  role        Role      @default(CONTRIBUTOR)
+  createdById String
+  expiresAt   DateTime
+  acceptedAt  DateTime?
+  acceptedBy  String?
+  createdAt   DateTime  @default(now())
+
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  createdBy User    @relation("InvitesCreated", fields: [createdById], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+}
+
+model MagicLinkToken {
+  id        String    @id @default(cuid())
+  tokenHash String    @unique
+  userId    String
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model UploadEvent {
+  id        String   @id @default(cuid())
+  userId    String
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+}
